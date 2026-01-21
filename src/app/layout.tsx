@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Toaster } from "@/components/providers/Toaster";
+import { CallProvider } from "@/context/CallContext";
+import { CallOverlay } from "@/components/calling/CallOverlay";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -28,8 +30,11 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
         <Toaster />
+        <CallProvider>
+          <CallOverlay />
+          {children}
+        </CallProvider>
       </body>
     </html>
   );

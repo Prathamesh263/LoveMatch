@@ -3,10 +3,12 @@
 import { useState, useEffect, useRef } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Send, MoreVertical, Phone, Video, ChevronLeft, Mic, Square, Trash2, Play, Pause } from 'lucide-react'
+import { toast } from 'sonner'
 import Image from 'next/image'
 import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
 import { format } from 'date-fns'
+import { useCall } from '@/context/CallContext'
 
 interface Message {
     id: string
@@ -30,6 +32,7 @@ export function ChatWindow({ initialMessages, currentUser, otherUser }: ChatWind
     const [sending, setSending] = useState(false)
     const scrollRef = useRef<HTMLDivElement>(null)
     const supabase = createClient()
+    const { startCall } = useCall()
 
     // Voice Note State
     const [isRecording, setIsRecording] = useState(false)
@@ -114,7 +117,7 @@ export function ChatWindow({ initialMessages, currentUser, otherUser }: ChatWind
     // Real-time Subscription settings
     useEffect(() => {
         const channel = supabase
-            .channel('chat_room')
+            .channel(`chat:${currentUser.id}`)
             .on(
                 'postgres_changes',
                 {
@@ -128,7 +131,39 @@ export function ChatWindow({ initialMessages, currentUser, otherUser }: ChatWind
                     // Check if the message is from the person we are currently chatting with
                     if (newMsg.sender_id === otherUser.id) {
                         setMessages((prev) => [...prev, newMsg])
+                        // Optional: Play a sound
+                        // const audio = new Audio('/message-tone.mp3')
+                        // audio.play().catch(() => {})
+                    } else {
+                        // Message from someone else - maybe show a different notification?
+                        // For now we only care about the active chat
                     }
+
+                    // Show notification
+                    // Show custom notification with avatar
+                    toast(
+                        <div className="flex items-center gap-3 w-full">
+                            <div className="relative w-10 h-10 rounded-full overflow-hidden flex-shrink-0 border border-white/20">
+                                <Image
+                                    src={otherUser.avatar_url || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=800&auto=format&fit=crop&q=60'}
+                                    alt={otherUser.full_name}
+                                    fill
+                                    className="object-cover"
+                                />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                                <p className="text-sm font-semibold text-white truncate">
+                                    {newMsg.sender_id === otherUser.id ? otherUser.full_name : 'Someone'}
+                                </p>
+                                <p className="text-xs text-white/70 truncate">
+                                    {newMsg.type === 'audio' ? 'Sent a voice message' : newMsg.content}
+                                </p>
+                            </div>
+                        </div>
+                        , {
+                            duration: 4000,
+                            className: '!bg-black/80 !backdrop-blur-xl !border-white/10 !p-4 !rounded-2xl',
+                        })
                 }
             )
             .subscribe()
@@ -136,7 +171,7 @@ export function ChatWindow({ initialMessages, currentUser, otherUser }: ChatWind
         return () => {
             supabase.removeChannel(channel)
         }
-    }, [currentUser.id, otherUser.id, supabase])
+    }, [currentUser.id, otherUser.id, otherUser.full_name, supabase])
 
     const handleSendMessage = async (e?: React.FormEvent) => {
         e?.preventDefault()
@@ -237,8 +272,18 @@ export function ChatWindow({ initialMessages, currentUser, otherUser }: ChatWind
                     </div>
                 </div>
                 <div className="flex items-center gap-4 text-pink-500">
-                    <button className="hover:bg-white/10 p-2 rounded-full transition-colors"><Phone size={20} /></button>
-                    <button className="hover:bg-white/10 p-2 rounded-full transition-colors"><Video size={20} /></button>
+                    <button
+                        onClick={() => startCall(otherUser.id, 'voice', otherUser.full_name, otherUser.avatar_url)}
+                        className="hover:bg-white/10 p-2 rounded-full transition-colors"
+                    >
+                        <Phone size={20} />
+                    </button>
+                    <button
+                        onClick={() => startCall(otherUser.id, 'video', otherUser.full_name, otherUser.avatar_url)}
+                        className="hover:bg-white/10 p-2 rounded-full transition-colors"
+                    >
+                        <Video size={20} />
+                    </button>
                     <button className="hover:bg-white/10 p-2 rounded-full transition-colors text-white/40"><MoreVertical size={20} /></button>
                 </div>
             </div>
