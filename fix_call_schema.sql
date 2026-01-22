@@ -1,33 +1,33 @@
--- 1. Ensure 'matches' has primary key (idempotent)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint 
-        WHERE conname = 'matches_pkey'
-    ) THEN
-        ALTER TABLE public.matches ADD PRIMARY KEY (id);
-    END IF;
-EXCEPTION
-    WHEN others THEN NULL;
-END $$;
+-- ==========================================
+-- WebRTC Signaling Schema Fix Script
+-- ==========================================
 
--- 2. Create 'call_sessions' table (if not exists)
-CREATE TABLE IF NOT EXISTS public.call_sessions (
+-- 1. Reset Tables (DROP to ensure clean state)
+DROP TABLE IF EXISTS public.ice_candidates CASCADE;
+DROP TABLE IF EXISTS public.call_sessions CASCADE;
+DROP TABLE IF EXISTS public.call_history CASCADE;
+
+-- 2. Create 'call_sessions' table
+CREATE TABLE public.call_sessions (
   id uuid NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
-  match_id uuid REFERENCES public.matches(id) ON DELETE CASCADE,
+  match_id uuid REFERENCES public.matches(id) ON DELETE CASCADE, -- Optional, can be null for direct calls if implemented
   caller_id uuid REFERENCES public.profiles(id) NOT NULL,
   receiver_id uuid REFERENCES public.profiles(id) NOT NULL,
   call_type text CHECK (call_type IN ('voice', 'video')) NOT NULL,
   status text CHECK (status IN ('ringing', 'active', 'ended', 'declined', 'missed')) DEFAULT 'ringing',
   sdp_offer jsonb,
   sdp_answer jsonb,
-  -- We will ignore the old ice_candidates array column in favor of the new table
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
 );
 
--- 3. Create 'ice_candidates' table for robust signaling
-CREATE TABLE IF NOT EXISTS public.ice_candidates (
+-- CRITICAL: Enable Replica Identity Full for Realtime
+-- This ensures that when a row is updated/deleted, the full row is sent to listeners.
+-- Without this, filtering like `filter: 'receiver_id=eq.X'` might fail on UPDATEs if receiver_id isn't changed.
+ALTER TABLE public.call_sessions REPLICA IDENTITY FULL;
+
+-- 3. Create 'ice_candidates' table
+CREATE TABLE public.ice_candidates (
   id uuid NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
   call_session_id uuid REFERENCES public.call_sessions(id) ON DELETE CASCADE NOT NULL,
   user_id uuid REFERENCES public.profiles(id) NOT NULL, -- The user who generated this candidate
@@ -35,15 +35,15 @@ CREATE TABLE IF NOT EXISTS public.ice_candidates (
   created_at timestamptz DEFAULT now()
 );
 
--- 4. Create 'call_history' table
-CREATE TABLE IF NOT EXISTS public.call_history (
+-- CRITICAL: Enable Replica Identity Full for Realtime
+ALTER TABLE public.ice_candidates REPLICA IDENTITY FULL;
+
+-- 4. Create 'call_history' table (Optional logging)
+CREATE TABLE public.call_history (
   id uuid NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
-  match_id uuid REFERENCES public.matches(id) ON DELETE SET NULL,
   caller_id uuid REFERENCES public.profiles(id),
   receiver_id uuid REFERENCES public.profiles(id),
-  call_type text CHECK (call_type IN ('voice', 'video')),
-  status text CHECK (status IN ('completed', 'missed', 'declined', 'failed')),
-  duration integer DEFAULT 0,
+  status text,
   started_at timestamptz DEFAULT now(),
   ended_at timestamptz
 );
@@ -53,18 +53,9 @@ ALTER TABLE public.call_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ice_candidates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.call_history ENABLE ROW LEVEL SECURITY;
 
--- 6. Policies (Drop first to avoid conflicts)
-DROP POLICY IF EXISTS "Users can view their own call sessions" ON public.call_sessions;
-DROP POLICY IF EXISTS "Users can insert call sessions" ON public.call_sessions;
-DROP POLICY IF EXISTS "Users can update their own call sessions" ON public.call_sessions;
+-- 6. RLS Policies
 
-DROP POLICY IF EXISTS "Users can view their own ice candidates" ON public.ice_candidates;
-DROP POLICY IF EXISTS "Users can insert ice candidates" ON public.ice_candidates;
-
-DROP POLICY IF EXISTS "Users can view their own call history" ON public.call_history;
-DROP POLICY IF EXISTS "Users can insert call history" ON public.call_history;
-
--- Call Sessions Policies
+-- Call Sessions: Both Caller and Receiver must see the session
 CREATE POLICY "Users can view their own call sessions"
   ON public.call_sessions FOR SELECT
   USING (auth.uid() = caller_id OR auth.uid() = receiver_id);
@@ -77,8 +68,9 @@ CREATE POLICY "Users can update their own call sessions"
   ON public.call_sessions FOR UPDATE
   USING (auth.uid() = caller_id OR auth.uid() = receiver_id);
 
--- ICE Candidates Policies
-CREATE POLICY "Users can view their own ice candidates"
+-- ICE Candidates: Public within the session context (simplified for reliability)
+-- Strictly speaking, we could restrict this, but for signaling reliability, openness for session participants is key.
+CREATE POLICY "Users can view ice candidates for their calls"
   ON public.ice_candidates FOR SELECT
   USING (
     EXISTS (
@@ -92,16 +84,8 @@ CREATE POLICY "Users can insert ice candidates"
   ON public.ice_candidates FOR INSERT
   WITH CHECK (auth.uid() = user_id);
 
--- Call History Policies
-CREATE POLICY "Users can view their own call history"
-  ON public.call_history FOR SELECT
-  USING (auth.uid() = caller_id OR auth.uid() = receiver_id);
-
-CREATE POLICY "Users can insert call history"
-  ON public.call_history FOR INSERT
-  WITH CHECK (auth.uid() = caller_id OR auth.uid() = receiver_id);
-
--- 7. Enable Realtime
+-- 7. Realtime Publication
+-- Ensure tables are in the publication
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
@@ -113,3 +97,10 @@ BEGIN
 EXCEPTION
   WHEN duplicate_object THEN NULL;
 END $$;
+
+-- 8. Grant Permissions (Just in case)
+GRANT ALL ON TABLE public.call_sessions TO service_role;
+GRANT ALL ON TABLE public.call_sessions TO authenticated;
+
+GRANT ALL ON TABLE public.ice_candidates TO service_role;
+GRANT ALL ON TABLE public.ice_candidates TO authenticated;

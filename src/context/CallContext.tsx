@@ -60,6 +60,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     const localStreamRef = useRef<MediaStream | null>(null)
     const callStatusRef = useRef<CallStatus>(callStatus)
 
+    // Signaling Refs
+    const remoteCandidatesQueue = useRef<any[]>([])
+    const processedCandidateIds = useRef<Set<string>>(new Set())
+
     // Sync ref with state
     useEffect(() => {
         callStatusRef.current = callStatus
@@ -133,7 +137,17 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                         }
                     }
                 )
-                .subscribe()
+                .subscribe((status) => {
+                    console.log(`Realtime Incoming Call Status for ${userId}:`, status)
+                    if (status === 'SUBSCRIBED') {
+                        // toast.success("Ready for calls") // Debug only
+                    } else if (status === 'CHANNEL_ERROR') {
+                        console.error("Realtime channel error")
+                        toast.error("Connection error: Calls may not work")
+                    } else if (status === 'TIMED_OUT') {
+                        console.error("Realtime connection timed out")
+                    }
+                })
         }
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
@@ -164,40 +178,117 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     }, [supabase])
 
 
-    // --- Core WebRTC Functions ---
+    // --- Helper Functions (Hoisted) ---
 
-    const createPeerConnection = (userId: string, sessionId: string, onRemoteStream: (stream: MediaStream) => void) => {
-        const pc = new RTCPeerConnection(rtcConfig)
-
-        // Handle ICE candidates
-        pc.onicecandidate = async (event) => {
-            if (event.candidate) {
-                await supabase.from('ice_candidates').insert({
-                    call_session_id: sessionId,
-                    user_id: userId,
-                    candidate: event.candidate // JSONB handles object automatically
-                })
-            }
+    // Helper for errors
+    const handleMediaError = (err: any) => {
+        if (err.name === 'NotReadableError') {
+            toast.error("Camera/Mic is busy. Please close other apps using it.")
+        } else if (err.name === 'NotAllowedError') {
+            toast.error("Permission denied. Please allow access to camera/mic.")
+        } else if (err.name === 'NotFoundError') {
+            toast.error("No camera/mic found.")
+        } else {
+            toast.error("Call failed")
         }
-
-        // Handle Connection State
-        pc.onconnectionstatechange = () => {
-            console.log('Connection state:', pc.connectionState)
-            if (pc.connectionState === 'connected') {
-                setCallStatus('active')
-            } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                // Handle disconnection?
-            }
-        }
-
-        // Handle Remote Stream
-        pc.ontrack = (event) => {
-            console.log('Received remote track')
-            onRemoteStream(event.streams[0])
-        }
-
-        return pc
     }
+
+    const cleanupCall = () => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(track => track.stop())
+        }
+        if (peerConnection.current) {
+            peerConnection.current.close()
+            peerConnection.current = null
+        }
+        setLocalStream(null)
+        setRemoteStream(null)
+        setCallStatus('idle')
+        setActiveCallSession(null)
+        setCallerInfo(null)
+        setIsMuted(false)
+        setIsVideoOff(false)
+
+        // Clear Queues
+        remoteCandidatesQueue.current = []
+        processedCandidateIds.current.clear()
+
+        // Ideally unsubscribe from channels here too, but they are scoped to functions currently or global
+        // Real app should manage channel refs
+    }
+
+    const processRemoteCandidate = async (candidateData: { candidate: any, id?: string }) => {
+        // Deduplication
+        if (candidateData.id) {
+            if (processedCandidateIds.current.has(candidateData.id)) {
+                return
+            }
+            processedCandidateIds.current.add(candidateData.id)
+        }
+
+        const pc = peerConnection.current
+        if (!pc) return
+
+        const candidate = new RTCIceCandidate(candidateData.candidate)
+
+        // If we have a remote description, add immediately
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+            try {
+                await pc.addIceCandidate(candidate)
+            } catch (e) {
+                console.warn("Error adding ICE candidate:", e)
+            }
+        } else {
+            // Otherwise buffer
+            console.log("Buffering ICE candidate (remote desc not ready)")
+            remoteCandidatesQueue.current.push(candidateData)
+        }
+    }
+
+    const flushRemoteCandidatesQueue = async () => {
+        const pc = peerConnection.current
+        if (!pc || !pc.remoteDescription) return
+
+        const queue = remoteCandidatesQueue.current
+        if (queue.length === 0) return
+
+        console.log(`Flushing ${queue.length} buffered candidates`)
+
+        for (const candidateData of queue) {
+            const candidate = new RTCIceCandidate(candidateData.candidate)
+            try {
+                await pc.addIceCandidate(candidate)
+            } catch (e) {
+                console.warn("Error flushing ICE candidate:", e)
+            }
+        }
+        // Clear queue
+        remoteCandidatesQueue.current = []
+    }
+
+    const toggleMute = () => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getAudioTracks().forEach(track => {
+                track.enabled = !track.enabled
+            })
+            setIsMuted(!isMuted)
+        }
+    }
+
+    const toggleVideo = () => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getVideoTracks().forEach(track => {
+                track.enabled = !track.enabled
+            })
+            setIsVideoOff(!isVideoOff)
+        }
+    }
+
+    const switchCamera = async () => {
+        // Placeholder
+    }
+
+    // --- Core WebRTC Functions ---
 
     const startCall = async (receiverId: string, type: CallType, receiverName: string, receiverAvatar: string) => {
         try {
@@ -205,6 +296,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
             setCallerInfo({ name: receiverName, avatar: receiverAvatar })
             setCallStatus('outgoing')
+
+            // Reset queues
+            remoteCandidatesQueue.current = []
+            processedCandidateIds.current = new Set()
 
             // 1. Get Local Media
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -214,12 +309,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             setLocalStream(stream)
             localStreamRef.current = stream
 
-            // 2. Create Session DB Entry First (to get ID)
-            // We need the ID for ICE candidates
-            // But we need the Offer to create the session in one go usually? 
-            // Actually, we can insert without offer first? No, schema implies we might want offer. 
-            // Let's CREATE Offer first, then insert.
-
+            // 2. Initialize Peer Connection
             const pc = new RTCPeerConnection(rtcConfig)
             peerConnection.current = pc
 
@@ -229,9 +319,19 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                 setRemoteStream(event.streams[0])
             }
 
+            // Buffer candidates until session is created
+            const candidatesQueue: RTCIceCandidate[] = []
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    candidatesQueue.push(event.candidate)
+                }
+            }
+
+            // 3. Create Offer
             const offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
 
+            // 4. Create Session in DB
             const { data: session, error } = await supabase
                 .from('call_sessions')
                 .insert({
@@ -240,38 +340,41 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                     call_type: type,
                     status: 'ringing',
                     sdp_offer: offer,
-                    // match_id is required by schema, assuming we have it or can fake it? 
-                    // Schema says match_id references public.matches(id). 
-                    // CRITICAL: We need a valid match_id. 
-                    // For now, if we don't have it passed in, we face an issue. 
-                    // Assuming this function is called from a context where we might know match_id?
-                    // Or we default to a specific match logic. 
-                    // Wait, the previous code didn't use match_id? 
-                    // The schema requires it: `match_id uuid references public.matches(id)`. 
-                    // I will need to find the match_id between these two users.
+                    // Note regarding match_id: The DB schema requires it.
+                    // If you encounter errors here, ensure a trigger or logic provides a valid match_id.
                 })
                 .select()
                 .single()
 
-            // If we fail here due to match_id constraint, we need to find it. 
-            // Helper to get match_id:
-            if (error) throw error
+            if (error) {
+                console.error("Error creating call session:", error)
+                throw error
+            }
 
             setActiveCallSession(session)
 
-            // 3. ICE Handling
+            // 5. Flush Buffered Candidates & Update Handler
+            if (candidatesQueue.length > 0) {
+                const inserts = candidatesQueue.map(c => ({
+                    call_session_id: session.id,
+                    user_id: currentUser.id,
+                    candidate: c.toJSON()
+                }))
+                await supabase.from('ice_candidates').insert(inserts)
+            }
+
             pc.onicecandidate = async (event) => {
-                if (event.candidate && session) {
+                if (event.candidate) {
                     await supabase.from('ice_candidates').insert({
                         call_session_id: session.id,
                         user_id: currentUser.id,
-                        candidate: event.candidate
+                        candidate: event.candidate.toJSON()
                     })
                 }
             }
 
-            // 4. Subscribe to Answer
-            const answerChannel = supabase
+            // 6. Subscribe to Answer & Remote Candidates
+            const channel = supabase
                 .channel(`call_signaling:${session.id}`)
                 .on(
                     'postgres_changes',
@@ -286,18 +389,16 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                         if (updated.sdp_answer && !pc.currentRemoteDescription) {
                             console.log("Received Answer")
                             await pc.setRemoteDescription(new RTCSessionDescription(updated.sdp_answer))
+                            await flushRemoteCandidatesQueue()
+                            setCallStatus('active')
                         }
+
                         if (updated.status === 'declined' || updated.status === 'ended') {
                             cleanupCall()
                             toast.info(`Call ${updated.status}`)
                         }
                     }
                 )
-                .subscribe()
-
-            // 5. Subscribe to Remote ICE Candidates
-            const iceChannel = supabase
-                .channel(`ice_candidates:${session.id}`)
                 .on(
                     'postgres_changes',
                     {
@@ -309,13 +410,14 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                     async (payload) => {
                         const newCandidate = payload.new
                         if (newCandidate.user_id !== currentUser.id) {
-                            console.log("Received remote ICE candidate")
-                            await pc.addIceCandidate(new RTCIceCandidate(newCandidate.candidate))
+                            await processRemoteCandidate({
+                                candidate: newCandidate.candidate,
+                                id: newCandidate.id
+                            })
                         }
                     }
                 )
                 .subscribe()
-
 
         } catch (err: any) {
             console.error("Start call error:", err)
@@ -327,7 +429,13 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     const acceptCall = async () => {
         if (!activeCallSession || !currentUser) return
 
+        // Reset processing state for new call
+        remoteCandidatesQueue.current = []
+        processedCandidateIds.current = new Set()
+
         try {
+            // Use currentUser (already checked) instead of re-fetching
+
             // 1. Get Local Media
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: true,
@@ -351,7 +459,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                     await supabase.from('ice_candidates').insert({
                         call_session_id: activeCallSession.id,
                         user_id: currentUser.id,
-                        candidate: event.candidate
+                        candidate: event.candidate.toJSON()
                     })
                 }
             }
@@ -359,23 +467,13 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             // 3. Set Remote Description (Offer)
             await pc.setRemoteDescription(new RTCSessionDescription(activeCallSession.sdp_offer))
 
-            // 4. Create Answer
-            const answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
+            // 3.5 Flush any candidates that might have arrived (unlikely this early but good practice)
+            await flushRemoteCandidatesQueue()
 
-            // 5. Update Session with Answer
-            await supabase
-                .from('call_sessions')
-                .update({
-                    status: 'active',
-                    sdp_answer: answer
-                })
-                .eq('id', activeCallSession.id)
-
-            setCallStatus('active')
-
-            // 6. Subscribe to Remote ICE Candidates
-            const iceChannel = supabase
+            // 4. Start Subscription EARLY (to catch candidates while we fetch existing)
+            // Note: In Supabase Realtime, we should set up the listener before processing initial snapshot if possible, 
+            // but here we do granular fetches. We'll start listener now.
+            const channel = supabase
                 .channel(`ice_candidates:${activeCallSession.id}`)
                 .on(
                     'postgres_changes',
@@ -388,16 +486,13 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                     async (payload) => {
                         const newCandidate = payload.new
                         if (newCandidate.user_id !== currentUser.id) {
-                            console.log("Received remote ICE candidate")
-                            await pc.addIceCandidate(new RTCIceCandidate(newCandidate.candidate))
+                            await processRemoteCandidate({
+                                candidate: newCandidate.candidate,
+                                id: newCandidate.id
+                            })
                         }
                     }
                 )
-                .subscribe()
-
-            // 7. Subscribe to Session Updates (for end call)
-            const sessionChannel = supabase
-                .channel(`call_signaling_receiver:${activeCallSession.id}`)
                 .on(
                     'postgres_changes',
                     {
@@ -415,6 +510,40 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                     }
                 )
                 .subscribe()
+
+            // 5. Fetch Existing Remote Candidates
+            const { data: existingCandidates } = await supabase
+                .from('ice_candidates')
+                .select('*')
+                .eq('call_session_id', activeCallSession.id)
+                .neq('user_id', currentUser.id)
+
+            if (existingCandidates) {
+                console.log(`Found ${existingCandidates.length} existing remote candidates`)
+                for (const candidateData of existingCandidates) {
+                    await processRemoteCandidate({
+                        candidate: candidateData.candidate,
+                        id: candidateData.id
+                    })
+                }
+            }
+
+            // 6. Create Answer
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            // 7. Update Session with Answer
+            await supabase
+                .from('call_sessions')
+                .update({
+                    status: 'active',
+                    sdp_answer: answer
+                })
+                .eq('id', activeCallSession.id)
+
+            setCallStatus('active')
+
+            // Channel is already subscribed above
 
         } catch (err: any) {
             console.error("Accept call error:", err)
@@ -441,59 +570,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         cleanupCall()
     }
 
-    const cleanupCall = () => {
-        if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach(track => track.stop())
-        }
-        if (peerConnection.current) {
-            peerConnection.current.close()
-            peerConnection.current = null
-        }
-        setLocalStream(null)
-        setRemoteStream(null)
-        setCallStatus('idle')
-        setActiveCallSession(null)
-        setCallerInfo(null)
-        setIsMuted(false)
-        setIsVideoOff(false)
-        // Ideally unsubscribe from channels here too, but they are scoped to functions currently or global
-        // Real app should manage channel refs
-    }
 
-    // Helper for errors
-    const handleMediaError = (err: any) => {
-        if (err.name === 'NotReadableError') {
-            toast.error("Camera/Mic is busy. Please close other apps using it.")
-        } else if (err.name === 'NotAllowedError') {
-            toast.error("Permission denied. Please allow access to camera/mic.")
-        } else if (err.name === 'NotFoundError') {
-            toast.error("No camera/mic found.")
-        } else {
-            toast.error("Call failed")
-        }
-    }
-
-    const toggleMute = () => {
-        if (localStreamRef.current) {
-            localStreamRef.current.getAudioTracks().forEach(track => {
-                track.enabled = !track.enabled
-            })
-            setIsMuted(!isMuted)
-        }
-    }
-
-    const toggleVideo = () => {
-        if (localStreamRef.current) {
-            localStreamRef.current.getVideoTracks().forEach(track => {
-                track.enabled = !track.enabled
-            })
-            setIsVideoOff(!isVideoOff)
-        }
-    }
-
-    const switchCamera = async () => {
-        // Placeholder
-    }
 
     return (
         <CallContext.Provider value={{
