@@ -59,6 +59,26 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     const peerConnection = useRef<RTCPeerConnection | null>(null)
     const localStreamRef = useRef<MediaStream | null>(null)
     const iceCandidatesQueue = useRef<RTCIceCandidate[]>([])
+    const callStatusRef = useRef<CallStatus>(callStatus)
+
+    // Sync ref with state
+    useEffect(() => {
+        callStatusRef.current = callStatus
+    }, [callStatus])
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            if (localStreamRef.current) {
+                console.log("CallProvider unmounting, stopping tracks")
+                localStreamRef.current.getTracks().forEach(track => track.stop())
+            }
+            if (peerConnection.current) {
+                peerConnection.current.close()
+            }
+        }
+    }, [])
+
 
     // Config
     const rtcConfig: RTCConfiguration = {
@@ -87,28 +107,35 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         iceCandidatesQueue.current = []
     }
 
-    // Listen for incoming calls
-    useEffect(() => {
-        const fetchUser = async () => {
-            const { data: { user } } = await supabase.auth.getUser()
-            if (!user) return
+    const [currentUser, setCurrentUser] = useState<any>(null)
 
-            const channel = supabase
-                .channel(`calls:${user.id}`)
+    // Listen for auth changes and set up realtime
+    useEffect(() => {
+        let channel: any = null
+
+        const setupSubscription = async (userId: string) => {
+            if (channel) {
+                supabase.removeChannel(channel)
+            }
+
+            channel = supabase
+                .channel(`calls:${userId}`)
                 .on(
                     'postgres_changes',
                     {
                         event: 'INSERT',
                         schema: 'public',
                         table: 'call_sessions',
-                        filter: `receiver_id=eq.${user.id}`,
+                        filter: `receiver_id=eq.${userId}`,
                     },
                     async (payload) => {
+                        console.log('Incoming call payload:', payload) // Debug log
                         const newSession = payload.new as CallSession
                         if (newSession.status === 'ringing') {
                             // Verify status is idle, else auto-decline "busy"
-                            if (callStatus !== 'idle') {
+                            if (callStatusRef.current !== 'idle') {
                                 // TODO: Mark as declined/busy
+                                console.log('User is busy, ignoring call')
                                 return
                             }
 
@@ -138,7 +165,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                         event: 'UPDATE',
                         schema: 'public',
                         table: 'call_sessions',
-                        filter: `receiver_id=eq.${user.id}`, // As receiver
+                        filter: `receiver_id=eq.${userId}`, // As receiver
                     },
                     (payload) => handleCallUpdate(payload.new as CallSession)
                 )
@@ -148,19 +175,45 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                         event: 'UPDATE',
                         schema: 'public',
                         table: 'call_sessions',
-                        filter: `caller_id=eq.${user.id}`, // As caller
+                        filter: `caller_id=eq.${userId}`, // As caller
                     },
                     (payload) => handleCallUpdate(payload.new as CallSession)
                 )
-                .subscribe()
+                .subscribe((status) => {
+                    console.log(`Call subscription status for ${userId}:`, status)
+                })
+        }
 
-            return () => {
+        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+            if (session?.user) {
+                setCurrentUser(session.user)
+                await setupSubscription(session.user.id)
+            } else {
+                setCurrentUser(null)
+                if (channel) {
+                    supabase.removeChannel(channel)
+                    channel = null
+                }
+            }
+        })
+
+        // Initial check
+        supabase.auth.getUser().then(({ data: { user } }) => {
+            if (user) {
+                setCurrentUser(user)
+                setupSubscription(user.id)
+            }
+        })
+
+        return () => {
+            subscription.unsubscribe()
+            if (channel) {
                 supabase.removeChannel(channel)
             }
         }
+    }, [supabase]) // Removed callStatus to avoid re-subscribing loop
 
-        fetchUser()
-    }, [supabase, callStatus])
+
 
 
     const handleCallUpdate = async (session: CallSession) => {
@@ -191,8 +244,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
     const startCall = async (receiverId: string, type: CallType, receiverName: string, receiverAvatar: string) => {
         try {
-            const { data: { user } } = await supabase.auth.getUser()
-            if (!user) throw new Error("Not authenticated")
+            if (!currentUser) {
+                toast.error("Not authenticated. Please refresh.")
+                return
+            }
+            const user = currentUser
 
             setCallerInfo({ name: receiverName, avatar: receiverAvatar })
             setCallStatus('outgoing')
@@ -250,10 +306,18 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             // Start listening for candidates to update the session?
             // For MVP, we might skip complex trickle ICE via DB and just do it if we can.
 
-        } catch (err) {
-            console.error(err)
+        } catch (err: any) {
+            console.error("Start call error:", err)
+            if (err.name === 'NotReadableError') {
+                toast.error("Camera/Mic is busy. Please close other apps using it.")
+            } else if (err.name === 'NotAllowedError') {
+                toast.error("Permission denied. Please allow access to camera/mic.")
+            } else if (err.name === 'NotFoundError') {
+                toast.error("No camera/mic found.")
+            } else {
+                toast.error(`Failed to start call: ${err.message}`)
+            }
             cleanupCall()
-            toast.error("Failed to start call")
         }
     }
 
@@ -299,9 +363,15 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
             setCallStatus('active')
 
-        } catch (err) {
-            console.error(err)
-            toast.error("Failed to accept call")
+        } catch (err: any) {
+            console.error("Accept call error:", err)
+            if (err.name === 'NotReadableError') {
+                toast.error("Camera/Mic is busy. Please close other apps using it.")
+            } else if (err.name === 'NotAllowedError') {
+                toast.error("Permission denied. Please allow access to camera/mic.")
+            } else {
+                toast.error("Failed to accept call")
+            }
             cleanupCall()
         }
     }
