@@ -4,6 +4,9 @@ import React, { createContext, useContext, useEffect, useRef, useState } from 'r
 import { createClient } from '@/lib/supabase/client'
 import { toast } from 'sonner'
 import { useRouter } from 'next/navigation'
+import { audioManager } from '@/lib/audioManager'
+import { vibrationManager } from '@/lib/vibrationManager'
+import { showIncomingCallNotification } from '@/lib/notifications'
 
 // Types
 export type CallType = 'voice' | 'video'
@@ -28,6 +31,7 @@ interface CallContextType {
     acceptCall: () => Promise<void>
     rejectCall: () => Promise<void>
     endCall: () => Promise<void>
+    markMissedCallsAsViewed: (matchId: string) => Promise<void>
     toggleMute: () => void
     toggleVideo: () => void
     switchCamera: () => Promise<void>
@@ -79,6 +83,8 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             if (peerConnection.current) {
                 peerConnection.current.close()
             }
+            audioManager.stopAllRingtones()
+            vibrationManager.stopVibration()
         }
     }, [])
 
@@ -130,6 +136,13 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                                     name: callerProfile.full_name,
                                     avatar: callerProfile.avatar_url
                                 })
+                                // Trigger Notifications & Sounds
+                                audioManager.playIncomingRingtone()
+                                vibrationManager.vibrateIncoming()
+                                showIncomingCallNotification(
+                                    { name: callerProfile.full_name, avatar: callerProfile.avatar_url },
+                                    newSession.id
+                                )
                             }
 
                             setActiveCallSession(newSession)
@@ -177,6 +190,53 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         }
     }, [supabase])
 
+    // Watch for call cancellation (Caller hangs up) while ringing
+    useEffect(() => {
+        if (callStatus === 'incoming' && activeCallSession) {
+            const channel = supabase
+                .channel(`call_status_watch:${activeCallSession.id}`)
+                .on(
+                    'postgres_changes',
+                    {
+                        event: 'UPDATE',
+                        schema: 'public',
+                        table: 'call_sessions',
+                        filter: `id=eq.${activeCallSession.id}`
+                    },
+                    (payload) => {
+                        const updated = payload.new as CallSession
+                        if (updated.status === 'ended' || updated.status === 'missed') {
+                            console.log("Call ended by caller while ringing")
+                            cleanupCall()
+                            toast.info("Call ended")
+                        }
+                    }
+                )
+                .subscribe()
+
+            return () => {
+                supabase.removeChannel(channel)
+            }
+        }
+    }, [callStatus, activeCallSession, supabase])
+
+
+    // Load Ringtone Preference
+    useEffect(() => {
+        const loadRingtone = async () => {
+            if (!currentUser) return
+            const { data } = await supabase
+                .from('user_preferences')
+                .select('ringtone')
+                .eq('user_id', currentUser.id)
+                .single()
+
+            if (data?.ringtone) {
+                audioManager.setRingtone(data.ringtone)
+            }
+        }
+        loadRingtone()
+    }, [currentUser, supabase])
 
     // --- Helper Functions (Hoisted) ---
 
@@ -208,6 +268,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
         setCallerInfo(null)
         setIsMuted(false)
         setIsVideoOff(false)
+
+        // Stop all sounds & vibrations
+        audioManager.stopAllRingtones()
+        vibrationManager.stopVibration()
 
         // Clear Queues
         remoteCandidatesQueue.current = []
@@ -296,6 +360,9 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
             setCallerInfo({ name: receiverName, avatar: receiverAvatar })
             setCallStatus('outgoing')
+
+            // Play outgoing tone
+            audioManager.playOutgoingTone()
 
             // Reset queues
             remoteCandidatesQueue.current = []
@@ -388,6 +455,9 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
                         const updated = payload.new as CallSession
                         if (updated.sdp_answer && !pc.currentRemoteDescription) {
                             console.log("Received Answer")
+                            audioManager.stopAllRingtones() // Stop outgoing tone
+                            audioManager.playCallConnected()
+
                             await pc.setRemoteDescription(new RTCSessionDescription(updated.sdp_answer))
                             await flushRemoteCandidatesQueue()
                             setCallStatus('active')
@@ -428,6 +498,12 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
     const acceptCall = async () => {
         if (!activeCallSession || !currentUser) return
+
+        // Stop ringing/vibration
+        audioManager.stopAllRingtones()
+        vibrationManager.stopVibration()
+        audioManager.playCallConnected()
+        vibrationManager.vibrateSingle()
 
         // Reset processing state for new call
         remoteCandidatesQueue.current = []
@@ -554,6 +630,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
     const rejectCall = async () => {
         if (!activeCallSession) return
+
+        // Stop ringing
+        audioManager.stopAllRingtones()
+        vibrationManager.stopVibration()
+
         await supabase
             .from('call_sessions')
             .update({ status: 'declined' })
@@ -563,11 +644,27 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
 
     const endCall = async () => {
         if (!activeCallSession) return
+
+        audioManager.playCallEnded()
+        vibrationManager.vibrateSingle()
+        audioManager.stopAllRingtones()
+
         await supabase
             .from('call_sessions')
             .update({ status: 'ended' })
             .eq('id', activeCallSession.id)
         cleanupCall()
+    }
+
+    const markMissedCallsAsViewed = async (matchId: string) => {
+        if (!currentUser) return
+        await supabase
+            .from('call_history')
+            .update({ viewed: true })
+            .eq('match_id', matchId)
+            .eq('receiver_id', currentUser.id)
+            .eq('status', 'missed')
+            .eq('viewed', false)
     }
 
 
@@ -580,6 +677,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             acceptCall,
             rejectCall,
             endCall,
+            markMissedCallsAsViewed,
             toggleMute,
             toggleVideo,
             switchCamera,

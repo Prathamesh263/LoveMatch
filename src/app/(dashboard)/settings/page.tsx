@@ -2,11 +2,12 @@
 
 import { useState } from 'react'
 import { GlassCard } from '@/components/ui/GlassCard'
-import { Bell, Lock, Globe, Shield, Trash2, LogOut, Moon, Volume2, ChevronRight, Mail } from 'lucide-react'
+import { Bell, Lock, Globe, Shield, Trash2, LogOut, Moon, Volume2, ChevronRight, Mail, Music } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
+import { RingtoneSettings } from '@/components/settings/RingtoneSettings'
 
 export default function SettingsPage() {
     const supabase = createClient()
@@ -98,6 +99,14 @@ export default function SettingsPage() {
                             <p className="text-white/40 text-xs">Always On</p>
                         </div>
                     </div>
+                </div>
+            </Section>
+
+            {/* Call Settings */}
+            <Section title="Call Settings" icon={Music}>
+                <div className="p-2">
+                    <h3 className="text-white font-medium text-sm mb-3 px-2">Incoming Call Ringtone</h3>
+                    <RingtoneSettings />
                 </div>
             </Section>
 

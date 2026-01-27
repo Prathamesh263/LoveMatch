@@ -7,6 +7,8 @@ import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { toast } from 'sonner'
+import { MissedCallBadge } from '@/components/calling/MissedCallBadge'
+import { useEffect, useState } from 'react'
 
 const navItems = [
     { href: '/discover', icon: Flame, label: 'Discover' },
@@ -19,6 +21,13 @@ export function Sidebar() {
     const pathname = usePathname()
     const supabase = createClient()
     const router = useRouter()
+    const [userId, setUserId] = useState<string | null>(null)
+
+    useEffect(() => {
+        supabase.auth.getUser().then(({ data: { user } }) => {
+            if (user) setUserId(user.id)
+        })
+    }, [supabase])
 
     const handleSignOut = async () => {
         await supabase.auth.signOut()
@@ -58,6 +67,11 @@ export function Sidebar() {
                                 )}
                             />
                             <span className="font-semibold">{item.label}</span>
+                            {item.label === 'Matches' && userId && (
+                                <div className="relative ml-auto">
+                                    <MissedCallBadge userId={userId} />
+                                </div>
+                            )}
                         </Link>
                     )
                 })}
